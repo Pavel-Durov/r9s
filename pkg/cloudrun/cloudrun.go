@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -217,6 +218,20 @@ func Edit(kind, name, region, project string) {
 	run := exec.Command(c[0], c[1:]...)
 	run.Stdin, run.Stdout, run.Stderr = os.Stdin, os.Stdout, os.Stderr
 	_ = run.Run()
+}
+
+// OpenConsole opens the resource's page in the GCP console in the default browser.
+func OpenConsole(kind, name, region, project string) error {
+	path := "detail"
+	if kind == "jobs" {
+		path = "jobs/details"
+	}
+	url := fmt.Sprintf("https://console.cloud.google.com/run/%s/%s/%s?project=%s", path, region, name, project)
+	opener := "xdg-open"
+	if runtime.GOOS == "darwin" {
+		opener = "open"
+	}
+	return exec.Command(opener, url).Start()
 }
 
 // Exec runs cmd in the foreground, piping its output to less when paged.

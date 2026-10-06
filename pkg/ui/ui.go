@@ -21,6 +21,7 @@ const keys = `
  e        edit YAML
  l        logs
  s        ssh
+ o        open in GCP console
  /        filter by name
  esc      back (clear filter, then project picker)
  r        refresh
@@ -239,6 +240,13 @@ func Run(project string) error {
 			app.SetFocus(helpView)
 		case ev.Rune() == 'p':
 			showPicker()
+		case ev.Rune() == 'o':
+			if sel >= 1 && sel <= len(visible) {
+				r := visible[sel-1]
+				if err := cloudrun.OpenConsole(kind, r[0], r[1], project); err != nil {
+					render("[red]open failed: " + err.Error())
+				}
+			}
 		case ev.Rune() == 'r':
 			load()
 		case ev.Rune() == 'q':

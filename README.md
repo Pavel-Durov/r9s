@@ -37,6 +37,7 @@ r9s -project my-project  # skips the picker
 | `e` | edit YAML in `$EDITOR`, then `gcloud run ... replace` after a y/N confirm |
 | `l` | last 1000 log lines (in `less`) |
 | `s` | SSH into an instance |
+| `o` | open in the GCP console |
 | `/` | filter by name |
 | `esc` | back |
 | `r` | refresh |
