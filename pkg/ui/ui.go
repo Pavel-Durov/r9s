@@ -3,7 +3,6 @@ package ui
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -30,8 +29,27 @@ const keys = `
 
  press any key to close`
 
+// Backend is where projects, resources and actions come from: cloudrun.Gcloud for real, cloudrun.Fake for -mock and tests.
+type Backend interface {
+	Projects() ([]string, error) // "id\tname" lines
+	List(k *cloudrun.Kind, project string) ([]cloudrun.Resource, error)
+	// Run performs a on r. Every action but Console takes over the terminal, so the UI suspends around it.
+	Run(a cloudrun.Action, r cloudrun.Resource) error
+}
+
+// actions maps keys to what they do to the selected resource; enter is also Describe.
+var actions = map[rune]cloudrun.Action{
+	'd': cloudrun.Describe, 'l': cloudrun.Logs, 'L': cloudrun.Tail,
+	's': cloudrun.SSH, 'e': cloudrun.Edit, 'o': cloudrun.Console,
+}
+
 // Run starts the TUI. With an empty project it opens the project picker first.
-func Run(project string) error {
+func Run(b Backend, project string) error {
+	return New(b, project).Run()
+}
+
+// New builds the TUI without running it, so tests can attach a simulation screen.
+func New(backend Backend, project string) *tview.Application {
 	app := tview.NewApplication()
 	header := tview.NewTextView().SetDynamicColors(true)
 	table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0).
@@ -60,51 +78,38 @@ func Run(project string) error {
 	})
 	pages.AddPage("help", helpView, true, false)
 
-	kind, filter := "services", ""
-	cache := map[string][][]string{}
-	var visible [][]string
+	st := newState(project)
+	var visible []cloudrun.Resource // rows on screen, in table order
 
 	render := func(status string) {
-		header.SetText(fmt.Sprintf("[::b]r9s[::-]  project: [green]%s[-]  view: [green]%s[-]  %s", project, kind, hint))
+		header.SetText(fmt.Sprintf("[::b]r9s[::-]  project: [green]%s[-]  view: [green]%s[-]  %s", st.project, st.kind.Name, hint))
 		table.Clear()
-		for i, c := range cloudrun.Columns[kind] {
+		for i, c := range st.kind.Columns {
 			table.SetCell(0, i, tview.NewTableCell(c).SetAttributes(tcell.AttrBold).SetSelectable(false).SetExpansion(1))
 		}
-		visible = nil
-		for _, r := range cache[kind] {
-			if filter == "" || strings.Contains(strings.ToLower(r[0]), strings.ToLower(filter)) {
-				visible = append(visible, r)
-			}
-		}
+		visible = st.visible()
 		for i, r := range visible {
 			color := tcell.ColorDefault
-			if r[2] != "True" {
+			if !r.Ready {
 				color = tcell.ColorRed
 			}
-			for j, v := range r {
+			for j, v := range r.Cells {
 				table.SetCell(i+1, j, tview.NewTableCell(v).SetTextColor(color).SetExpansion(1))
 			}
 		}
 		if status == "" {
-			status = fmt.Sprintf("%d %s", len(visible), kind)
-			if filter != "" {
-				status += fmt.Sprintf("  (filter: %s, <esc> clears)", filter)
-			}
+			status = st.status()
 		}
 		footer.SetText(status)
 	}
 
 	load := func() {
-		k, p := kind, project
-		render("loading " + k + "...")
+		k, p := st.kind, st.project
+		render("loading " + k.Name + "...")
 		go func() {
-			rows, err := cloudrun.Fetch(k, p)
+			rs, err := backend.List(k, p)
 			app.QueueUpdateDraw(func() {
-				if p != project { // project switched while loading
-					return
-				}
-				cache[k] = rows
-				if k != kind {
+				if !st.store(p, k, rs) {
 					return
 				}
 				if err != nil {
@@ -124,8 +129,7 @@ func Run(project string) error {
 			if strings.Contains(strings.ToLower(p), f) {
 				id := strings.SplitN(p, "\t", 2)[0]
 				pickerList.AddItem(strings.ReplaceAll(p, "\t", "  [gray]")+"[-]", "", 0, func() {
-					project, kind, filter = id, "services", ""
-					cache = map[string][][]string{}
+					st.pick(id)
 					pages.HidePage("picker")
 					app.SetFocus(table)
 					load()
@@ -144,7 +148,7 @@ func Run(project string) error {
 		}
 		pickerList.Clear().AddItem("loading projects...", "", 0, nil)
 		go func() {
-			ps, err := cloudrun.FetchProjects()
+			ps, err := backend.Projects()
 			app.QueueUpdateDraw(func() {
 				if err != nil {
 					pickerList.Clear().AddItem("[red]"+err.Error(), "", 0, nil)
@@ -179,7 +183,7 @@ func Run(project string) error {
 			app.SetFocus(pickerFilter)
 			return nil
 		case ev.Key() == tcell.KeyEscape:
-			if project != "" {
+			if st.project != "" {
 				pages.HidePage("picker")
 				app.SetFocus(table)
 			}
@@ -190,51 +194,48 @@ func Run(project string) error {
 
 	filterInput.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEnter {
-			filter = filterInput.GetText()
+			st.filter = filterInput.GetText()
 		}
 		bottom.SwitchToPage("footer")
 		app.SetFocus(table)
 		render("")
 	})
 
+	act := func(a cloudrun.Action, r cloudrun.Resource) {
+		var err error
+		if a == cloudrun.Console {
+			err = backend.Run(a, r)
+		} else {
+			app.Suspend(func() { err = backend.Run(a, r) })
+		}
+		switch {
+		case err != nil:
+			render("[red]" + err.Error())
+		case a == cloudrun.Edit:
+			load()
+		}
+	}
+
 	table.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 		sel, _ := table.GetSelection()
 		switch {
 		case ev.Key() == tcell.KeyTab:
-			kind = cloudrun.Kinds[(slices.Index(cloudrun.Kinds, kind)+1)%len(cloudrun.Kinds)]
-			filter = ""
+			needsLoad := st.nextKind()
 			table.Select(1, 0)
-			if _, ok := cache[kind]; ok {
-				render("")
-			} else {
+			if needsLoad {
 				load()
+			} else {
+				render("")
 			}
 		case ev.Key() == tcell.KeyEscape: // back: clear filter first, then up to the project picker
-			if filter != "" {
-				filter = ""
+			if st.filter != "" {
+				st.filter = ""
 				render("")
 			} else {
 				showPicker()
 			}
-		case ev.Key() == tcell.KeyEnter || ev.Rune() == 'd' || ev.Rune() == 'l' || ev.Rune() == 'L' || ev.Rune() == 's':
-			if sel < 1 || sel > len(visible) {
-				return nil
-			}
-			key := ev.Rune()
-			if ev.Key() == tcell.KeyEnter {
-				key = 'd'
-			}
-			r := visible[sel-1]
-			cmd, paged := cloudrun.Command(key, kind, r[0], r[1], project)
-			app.Suspend(func() { cloudrun.Exec(cmd, paged) })
-		case ev.Rune() == 'e':
-			if sel >= 1 && sel <= len(visible) {
-				r := visible[sel-1]
-				app.Suspend(func() { cloudrun.Edit(kind, r[0], r[1], project) })
-				load()
-			}
 		case ev.Rune() == '/':
-			filterInput.SetText(filter)
+			filterInput.SetText(st.filter)
 			bottom.SwitchToPage("filter")
 			app.SetFocus(filterInput)
 		case ev.Rune() == '?':
@@ -242,19 +243,21 @@ func Run(project string) error {
 			app.SetFocus(helpView)
 		case ev.Rune() == 'p':
 			showPicker()
-		case ev.Rune() == 'o':
-			if sel >= 1 && sel <= len(visible) {
-				r := visible[sel-1]
-				if err := cloudrun.OpenConsole(kind, r[0], r[1], project); err != nil {
-					render("[red]open failed: " + err.Error())
-				}
-			}
 		case ev.Rune() == 'r':
 			load()
 		case ev.Rune() == 'q':
 			app.Stop()
 		default:
-			return ev // j/k/arrows etc. handled by the table
+			a, ok := actions[ev.Rune()]
+			if ev.Key() == tcell.KeyEnter {
+				a, ok = cloudrun.Describe, true
+			}
+			if !ok {
+				return ev // j/k/arrows etc. handled by the table
+			}
+			if sel >= 1 && sel <= len(visible) {
+				act(a, visible[sel-1])
+			}
 		}
 		return nil
 	})
@@ -264,5 +267,5 @@ func Run(project string) error {
 	} else {
 		load()
 	}
-	return app.SetRoot(pages, true).Run()
+	return app.SetRoot(pages, true)
 }

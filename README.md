@@ -26,6 +26,7 @@ Or from a clone: `just install` (or `just run` to build and start).
 ```sh
 r9s                      # opens the project picker
 r9s -project my-project  # skips the picker
+r9s -mock                # built-in demo projects, services and jobs; no gcloud needed
 ```
 
 | key | action |
