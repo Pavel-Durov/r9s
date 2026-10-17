@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -165,6 +167,9 @@ func Command(key rune, kind, name, region, project string) ([]string, bool) {
 		return gcloud(project, "run", kind, "describe", name, "--region", region), true
 	case 'l':
 		return gcloud(project, "run", kind, "logs", "read", name, "--region", region, "--limit", "1000"), true
+	case 'L':
+		// Streams until ctrl-c; needs `gcloud components install beta log-streaming`.
+		return gcloud(project, "beta", "run", kind, "logs", "tail", name, "--region", region), false
 	default: // 's'
 		// Hidden gcloud commands; need `gcloud run deploy --ssh`. Jobs ssh is alpha-only.
 		track := "beta"
@@ -237,6 +242,10 @@ func OpenConsole(kind, name, region, project string) error {
 // Exec runs cmd in the foreground, piping its output to less when paged.
 func Exec(cmd []string, paged bool) {
 	fmt.Println("$ " + strings.Join(cmd, " "))
+	// Catch ctrl-c so it stops the child (e.g. a log tail) instead of killing r9s.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	defer signal.Stop(sig)
 	c := exec.Command(cmd[0], cmd[1:]...)
 	if paged {
 		less := exec.Command("less", "-R", "+G")
@@ -248,6 +257,9 @@ func Exec(cmd []string, paged bool) {
 			_ = c.Wait()
 			return
 		}
+	}
+	if slices.Contains(cmd, "tail") {
+		fmt.Println("waiting for new log lines (ctrl-c to stop)...")
 	}
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	_ = c.Run()

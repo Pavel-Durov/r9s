@@ -19,7 +19,8 @@ const keys = `
  tab      switch services / jobs
  enter,d  describe
  e        edit YAML
- l        logs
+ l        logs (last 1000 lines)
+ L        live tail logs (ctrl-c to stop)
  s        ssh
  o        open in GCP console
  /        filter by name
@@ -33,7 +34,8 @@ const keys = `
 func Run(project string) error {
 	app := tview.NewApplication()
 	header := tview.NewTextView().SetDynamicColors(true)
-	table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
+	table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0).
+		SetSelectedStyle(tcell.StyleDefault.Background(tcell.ColorAqua).Foreground(tcell.ColorBlack))
 	footer := tview.NewTextView().SetDynamicColors(true)
 	filterInput := tview.NewInputField().SetLabel("/")
 	bottom := tview.NewPages().AddPage("footer", footer, true, true).AddPage("filter", filterInput, true, false)
@@ -214,7 +216,7 @@ func Run(project string) error {
 			} else {
 				showPicker()
 			}
-		case ev.Key() == tcell.KeyEnter || ev.Rune() == 'd' || ev.Rune() == 'l' || ev.Rune() == 's':
+		case ev.Key() == tcell.KeyEnter || ev.Rune() == 'd' || ev.Rune() == 'l' || ev.Rune() == 'L' || ev.Rune() == 's':
 			if sel < 1 || sel > len(visible) {
 				return nil
 			}

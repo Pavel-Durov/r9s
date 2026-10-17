@@ -36,6 +36,7 @@ r9s -project my-project  # skips the picker
 | `enter` / `d` | describe (in `less`) |
 | `e` | edit YAML in `$EDITOR`, then `gcloud run ... replace` after a y/N confirm |
 | `l` | last 1000 log lines (in `less`) |
+| `L` | live tail logs, `ctrl-c` to stop |
 | `s` | SSH into an instance |
 | `o` | open in the GCP console |
 | `/` | filter by name |
@@ -49,6 +50,7 @@ r9s -project my-project  # skips the picker
 - **SCALE** is the configured `min/max` instances (`-` if unset), not the live instance count. `gcloud run services list` doesn't report it.
 - **AGE** is the time since the service's Ready condition last changed, the same source as gcloud's "LAST DEPLOYED AT". It can reset if a service goes unhealthy and recovers.
 - **SSH** uses gcloud's hidden `gcloud beta run services ssh` (`alpha` for jobs, which needs `gcloud components install alpha`). The service must be deployed with `--ssh`.
+- **Live tail** uses `gcloud beta run ... logs tail`, which needs `gcloud components install beta log-streaming`.
 
 ## Development
 
