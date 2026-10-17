@@ -6,6 +6,9 @@ build:
 run *args: build
     ./r9s {{args}}
 
+mock: build
+    ./r9s -mock
+
 test:
     go vet ./...
     go test ./...

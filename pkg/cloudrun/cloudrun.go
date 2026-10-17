@@ -1,4 +1,4 @@
-// Package cloudrun lists Cloud Run resources and builds the gcloud commands r9s runs on them.
+// Package cloudrun lists Cloud Run resources and runs actions on them, through gcloud or the demo Fake.
 package cloudrun
 
 import (
@@ -6,20 +6,57 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
-	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
-var Kinds = []string{"services", "jobs"}
-
-var Columns = map[string][]string{
-	"services": {"NAME", "REGION", "READY", "SCALE", "MEM", "REVISION", "URL", "AGE"},
-	"jobs":     {"NAME", "REGION", "READY", "LAST EXECUTION", "COMPLETED"},
+// Kind is a Cloud Run resource type and everything that differs between services and jobs.
+type Kind struct {
+	Name        string // gcloud noun: "services" or "jobs"
+	Columns     []string
+	cells       func(resource) []string // one value per column
+	consolePath string                  // console URL segment before /region/name
+	sshTrack    string                  // gcloud release track that has `run <kind> ssh`
 }
+
+var (
+	Services = &Kind{
+		Name:        "services",
+		Columns:     []string{"NAME", "REGION", "READY", "SCALE", "MEM", "REVISION", "URL", "AGE"},
+		cells:       serviceCells,
+		consolePath: "detail",
+		sshTrack:    "beta", // hidden command; needs `gcloud run deploy --ssh`
+	}
+	Jobs = &Kind{
+		Name:        "jobs",
+		Columns:     []string{"NAME", "REGION", "READY", "LAST EXECUTION", "COMPLETED"},
+		cells:       jobCells,
+		consolePath: "jobs/details",
+		sshTrack:    "alpha", // jobs ssh is alpha-only
+	}
+	Kinds = []*Kind{Services, Jobs}
+)
+
+// Resource is one service or job: named identity for actions, Cells for display.
+type Resource struct {
+	Kind                  *Kind
+	Project, Name, Region string
+	Ready                 bool
+	Cells                 []string // one per Kind.Columns
+}
+
+// Action is something the user can do to a selected Resource.
+type Action int
+
+const (
+	Describe Action = iota
+	Logs            // last 1000 lines in a pager
+	Tail            // stream new lines until ctrl-c
+	SSH
+	Edit    // edit the YAML in $EDITOR and apply it
+	Console // open the GCP console in the browser; the only action that doesn't take over the terminal
+)
 
 // resource is the subset of the Knative-style JSON that `gcloud run ... list` returns.
 type resource struct {
@@ -94,21 +131,44 @@ func orDash(s string) string {
 	return s
 }
 
-func row(kind string, r resource) []string {
-	ready, deployed := "?", ""
+// ready returns the Ready condition's status ("?" if missing) and when it last changed.
+func ready(r resource) (status, since string) {
+	status = "?"
 	for _, c := range r.Status.Conditions {
 		if c.Type == "Ready" {
-			ready, deployed = c.Status, c.LastTransitionTime // same source as gcloud's "LAST DEPLOYED AT"
+			status, since = c.Status, c.LastTransitionTime // same source as gcloud's "LAST DEPLOYED AT"
 		}
 	}
-	region := r.Metadata.Labels["cloud.googleapis.com/location"]
-	if kind == "services" {
-		a := r.Spec.Template.Metadata.Annotations
-		scale := orDash(a["autoscaling.knative.dev/minScale"]) + "/" + orDash(a["autoscaling.knative.dev/maxScale"]) // min/max instances; live count isn't in gcloud's JSON
-		return []string{r.Metadata.Name, region, ready, scale, mem(r), r.Status.LatestReadyRevisionName, r.Status.URL, age(deployed)}
-	}
+	return status, since
+}
+
+func region(r resource) string { return r.Metadata.Labels["cloud.googleapis.com/location"] }
+
+func serviceCells(r resource) []string {
+	status, deployed := ready(r)
+	a := r.Spec.Template.Metadata.Annotations
+	scale := orDash(a["autoscaling.knative.dev/minScale"]) + "/" + orDash(a["autoscaling.knative.dev/maxScale"]) // min/max instances; live count isn't in gcloud's JSON
+	return []string{r.Metadata.Name, region(r), status, scale, mem(r), r.Status.LatestReadyRevisionName, r.Status.URL, age(deployed)}
+}
+
+func jobCells(r resource) []string {
+	status, _ := ready(r)
 	ex := r.Status.LatestCreatedExecution
-	return []string{r.Metadata.Name, region, ready, ex.Name, ex.CompletionTimestamp}
+	return []string{r.Metadata.Name, region(r), status, ex.Name, ex.CompletionTimestamp}
+}
+
+// parse turns `gcloud run <kind> list --format=json` output into resources.
+func parse(k *Kind, project string, out []byte) ([]Resource, error) {
+	var rs []resource
+	if err := json.Unmarshal(out, &rs); err != nil {
+		return nil, err
+	}
+	res := make([]Resource, len(rs))
+	for i, r := range rs {
+		status, _ := ready(r)
+		res[i] = Resource{Kind: k, Project: project, Name: r.Metadata.Name, Region: region(r), Ready: status == "True", Cells: k.cells(r)}
+	}
+	return res, nil
 }
 
 func gcloud(project string, args ...string) []string {
@@ -119,24 +179,27 @@ func gcloud(project string, args ...string) []string {
 	return cmd
 }
 
-func Fetch(kind, project string) ([][]string, error) {
-	c := gcloud(project, "run", kind, "list", "--format=json")
-	out, err := exec.Command(c[0], c[1:]...).Output()
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("%s", gcloudError(string(ee.Stderr)))
-		}
-		return nil, err
+// command is the gcloud command line for every action except Console.
+func command(a Action, r Resource) []string {
+	run := []string{"run", r.Kind.Name}
+	var args []string
+	switch a {
+	case Describe:
+		args = append(run, "describe", r.Name)
+	case Logs:
+		args = append(run, "logs", "read", r.Name, "--limit", "1000")
+	case Tail: // needs `gcloud components install beta log-streaming`
+		args = append(append([]string{"beta"}, run...), "logs", "tail", r.Name)
+	case SSH:
+		args = append(append([]string{r.Kind.sshTrack}, run...), "ssh", r.Name)
+	case Edit:
+		args = append(run, "describe", r.Name, "--format=export")
 	}
-	var rs []resource
-	if err := json.Unmarshal(out, &rs); err != nil {
-		return nil, err
-	}
-	rows := make([][]string, len(rs))
-	for i, r := range rs {
-		rows[i] = row(kind, r)
-	}
-	return rows, nil
+	return gcloud(r.Project, append(args, "--region", r.Region)...)
+}
+
+func consoleURL(r Resource) string {
+	return fmt.Sprintf("https://console.cloud.google.com/run/%s/%s/%s?project=%s", r.Kind.consolePath, r.Region, r.Name, r.Project)
 }
 
 // gcloudError picks the "ERROR: (gcloud.x) msg" line out of stderr and trims it to fit one line.
@@ -151,8 +214,11 @@ func gcloudError(stderr string) string {
 	return strings.TrimSpace(stderr)
 }
 
-// FetchProjects returns "id\tname" lines for every project the user can see.
-func FetchProjects() ([]string, error) {
+// Gcloud is the real backend: it shells out to gcloud.
+type Gcloud struct{}
+
+// Projects returns "id\tname" lines for every project the user can see.
+func (Gcloud) Projects() ([]string, error) {
 	out, err := exec.Command("gcloud", "projects", "list", "--sort-by=projectId", "--format=value(projectId,name)").Output()
 	if err != nil {
 		return nil, fmt.Errorf("gcloud projects list failed: %v", err)
@@ -160,113 +226,58 @@ func FetchProjects() ([]string, error) {
 	return strings.Split(strings.TrimSpace(string(out)), "\n"), nil
 }
 
-// Command returns the gcloud command for a key on the selected row, and whether to page its output.
-func Command(key rune, kind, name, region, project string) ([]string, bool) {
-	switch key {
-	case 'd':
-		return gcloud(project, "run", kind, "describe", name, "--region", region), true
-	case 'l':
-		return gcloud(project, "run", kind, "logs", "read", name, "--region", region, "--limit", "1000"), true
-	case 'L':
-		// Streams until ctrl-c; needs `gcloud components install beta log-streaming`.
-		return gcloud(project, "beta", "run", kind, "logs", "tail", name, "--region", region), false
-	default: // 's'
-		// Hidden gcloud commands; need `gcloud run deploy --ssh`. Jobs ssh is alpha-only.
-		track := "beta"
-		if kind == "jobs" {
-			track = "alpha"
+func (Gcloud) List(k *Kind, project string) ([]Resource, error) {
+	c := gcloud(project, "run", k.Name, "list", "--format=json")
+	out, err := exec.Command(c[0], c[1:]...).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("%s", gcloudError(string(ee.Stderr)))
 		}
-		return gcloud(project, track, "run", kind, "ssh", name, "--region", region), false
+		return nil, err
 	}
+	return parse(k, project, out)
 }
 
-// Edit exports the resource YAML, opens $EDITOR on it, and on confirmation applies it with `gcloud run <kind> replace`.
-func Edit(kind, name, region, project string) {
-	defer pause()
-	f, err := os.CreateTemp("", name+"-*.yaml")
-	if err != nil {
-		fmt.Println(err)
-		return
+func (Gcloud) Run(a Action, r Resource) error {
+	switch a {
+	case Console:
+		return openURL(consoleURL(r))
+	case Edit:
+		edit(r)
+	case Describe:
+		runPaged(command(a, r), false)
+	case Logs:
+		runPaged(command(a, r), true)
+	case Tail:
+		fmt.Println("waiting for new log lines (ctrl-c to stop)...")
+		runForeground(command(a, r))
+	case SSH:
+		runForeground(command(a, r))
 	}
-	defer os.Remove(f.Name())
-	export := gcloud(project, "run", kind, "describe", name, "--region", region, "--format=export")
-	out, err := exec.Command(export[0], export[1:]...).CombinedOutput()
+	return nil
+}
+
+// edit exports the resource YAML, opens $EDITOR on it, and on confirmation applies it with `gcloud run <kind> replace`.
+func edit(r Resource) {
+	defer pause()
+	c := command(Edit, r)
+	out, err := exec.Command(c[0], c[1:]...).CombinedOutput()
 	if err != nil {
 		fmt.Print(string(out))
 		return
 	}
-	f.Write(out)
-	f.Close()
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "vi"
-	}
-	ed := exec.Command("sh", "-c", editor+` "$0"`, f.Name()) // sh so EDITOR="code -w" works
-	ed.Stdin, ed.Stdout, ed.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := ed.Run(); err != nil {
+	path, changed, err := editTemp(r.Name, out)
+	defer os.Remove(path)
+	switch {
+	case err != nil:
 		fmt.Println(err)
-		return
-	}
-	edited, _ := os.ReadFile(f.Name())
-	if string(edited) == string(out) {
+	case !changed:
 		fmt.Println("no changes")
-		return
-	}
-	fmt.Printf("apply changes to %s %s? [y/N] ", kind, name)
-	var yes string
-	if fmt.Scanln(&yes); yes != "y" && yes != "Y" {
+	case !confirm(fmt.Sprintf("apply changes to %s %s?", r.Kind.Name, r.Name)):
 		fmt.Println("aborted")
-		return
+	default:
+		c = gcloud(r.Project, "run", r.Kind.Name, "replace", path, "--region", r.Region)
+		fmt.Println("$ " + strings.Join(c, " "))
+		_ = attached(c).Run()
 	}
-	c := gcloud(project, "run", kind, "replace", f.Name(), "--region", region)
-	fmt.Println("$ " + strings.Join(c, " "))
-	run := exec.Command(c[0], c[1:]...)
-	run.Stdin, run.Stdout, run.Stderr = os.Stdin, os.Stdout, os.Stderr
-	_ = run.Run()
-}
-
-// OpenConsole opens the resource's page in the GCP console in the default browser.
-func OpenConsole(kind, name, region, project string) error {
-	path := "detail"
-	if kind == "jobs" {
-		path = "jobs/details"
-	}
-	url := fmt.Sprintf("https://console.cloud.google.com/run/%s/%s/%s?project=%s", path, region, name, project)
-	opener := "xdg-open"
-	if runtime.GOOS == "darwin" {
-		opener = "open"
-	}
-	return exec.Command(opener, url).Start()
-}
-
-// Exec runs cmd in the foreground, piping its output to less when paged.
-func Exec(cmd []string, paged bool) {
-	fmt.Println("$ " + strings.Join(cmd, " "))
-	// Catch ctrl-c so it stops the child (e.g. a log tail) instead of killing r9s.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
-	defer signal.Stop(sig)
-	c := exec.Command(cmd[0], cmd[1:]...)
-	if paged {
-		less := exec.Command("less", "-R", "+G")
-		less.Stdout, less.Stderr = os.Stdout, os.Stderr
-		less.Stdin, _ = c.StdoutPipe()
-		c.Stderr = c.Stdout // show gcloud errors in the pager too
-		if err := c.Start(); err == nil {
-			_ = less.Run()
-			_ = c.Wait()
-			return
-		}
-	}
-	if slices.Contains(cmd, "tail") {
-		fmt.Println("waiting for new log lines (ctrl-c to stop)...")
-	}
-	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-	_ = c.Run()
-	pause()
-}
-
-func pause() {
-	fmt.Print("\n[press enter to return]")
-	fmt.Scanln()
 }
