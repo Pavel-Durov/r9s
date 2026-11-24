@@ -56,6 +56,7 @@ const (
 	SSH
 	Edit    // edit the YAML in $EDITOR and apply it
 	Console // open the GCP console in the browser; the only action that doesn't take over the terminal
+	Restart // services only: roll out a new revision with the same config
 )
 
 // resource is the subset of the Knative-style JSON that `gcloud run ... list` returns.
@@ -194,6 +195,8 @@ func command(a Action, r Resource) []string {
 		args = append(append([]string{r.Kind.sshTrack}, run...), "ssh", r.Name)
 	case Edit:
 		args = append(run, "describe", r.Name, "--format=export")
+	case Restart: // Cloud Run has no restart; any template change (labels included) rolls a new revision
+		args = append(run, "update", r.Name, "--update-labels", fmt.Sprintf("r9s-restarted-at=%d", time.Now().Unix()))
 	}
 	return gcloud(r.Project, append(args, "--region", r.Region)...)
 }
@@ -253,6 +256,13 @@ func (Gcloud) Run(a Action, r Resource) error {
 		runForeground(command(a, r))
 	case SSH:
 		runForeground(command(a, r))
+	case Restart:
+		if r.Kind != Services {
+			return fmt.Errorf("restart is for services only")
+		}
+		if confirm(fmt.Sprintf("restart %s? (deploys a new revision)", r.Name)) {
+			runForeground(command(a, r))
+		}
 	}
 	return nil
 }

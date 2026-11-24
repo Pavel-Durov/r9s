@@ -21,6 +21,7 @@ const keys = `
  l        logs (last 1000 lines)
  L        live tail logs (ctrl-c to stop)
  s        ssh
+ ctrl-r   restart service (new revision, after y/N)
  o        open in GCP console
  /        filter by name
  esc      back (clear filter, then project picker)
@@ -211,7 +212,7 @@ func New(backend Backend, project string) *tview.Application {
 		switch {
 		case err != nil:
 			render("[red]" + err.Error())
-		case a == cloudrun.Edit:
+		case a == cloudrun.Edit, a == cloudrun.Restart:
 			load()
 		}
 	}
@@ -243,14 +244,17 @@ func New(backend Backend, project string) *tview.Application {
 			app.SetFocus(helpView)
 		case ev.Rune() == 'p':
 			showPicker()
-		case ev.Rune() == 'r':
+		case ev.Key() == tcell.KeyRune && ev.Rune() == 'r': // ctrl-r also carries rune 'r'
 			load()
 		case ev.Rune() == 'q':
 			app.Stop()
 		default:
 			a, ok := actions[ev.Rune()]
-			if ev.Key() == tcell.KeyEnter {
+			switch ev.Key() {
+			case tcell.KeyEnter:
 				a, ok = cloudrun.Describe, true
+			case tcell.KeyCtrlR:
+				a, ok = cloudrun.Restart, true
 			}
 			if !ok {
 				return ev // j/k/arrows etc. handled by the table

@@ -60,6 +60,13 @@ func TestPickProjectThenSwitchKinds(t *testing.T) {
 	waitFor(t, app, s, "worker-search-index")
 	waitFor(t, app, s, "6 services")
 	s.InjectKey(tcell.KeyDown, 0, tcell.ModNone)
+	s.InjectKey(tcell.KeyCtrlR, 0, tcell.ModCtrl)
+	select {
+	case got := <-b.ran:
+		assert.Equal(t, fmt.Sprint(cloudrun.Restart, " web"), got)
+	case <-time.After(time.Second):
+		t.Fatal("ctrl-r never reached the backend")
+	}
 	s.InjectKey(tcell.KeyRune, 'L', tcell.ModNone)
 	select {
 	case got := <-b.ran:

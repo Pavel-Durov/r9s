@@ -32,6 +32,10 @@ func TestCommand(t *testing.T) {
 	assert.Equal(t, []string{"gcloud", "run", "services", "logs", "read", "api", "--limit", "1000", "--region", "eu"}, command(Logs, api))
 	assert.Equal(t, []string{"gcloud", "beta", "run", "services", "logs", "tail", "api", "--region", "eu"}, command(Tail, api))
 	assert.Equal(t, []string{"gcloud", "beta", "run", "services", "ssh", "api", "--region", "eu"}, command(SSH, api))
+	restart := command(Restart, api)
+	assert.Equal(t, []string{"gcloud", "run", "services", "update", "api", "--update-labels"}, restart[:6])
+	assert.Regexp(t, `^r9s-restarted-at=\d+$`, restart[6])
+	assert.Equal(t, []string{"--region", "eu"}, restart[7:])
 }
 
 func TestAge(t *testing.T) {

@@ -35,6 +35,7 @@ r9s -mock                # built-in demo projects, services and jobs; no gcloud 
 | `l` | last 1000 log lines (in `less`) |
 | `L` | live tail logs, `ctrl-c` to stop |
 | `s` | SSH into an instance |
+| `ctrl-r` | restart a service (rolls a new revision) after a y/N confirm |
 | `o` | open in the GCP console |
 | `/` | filter by name |
 | `esc` | back |
